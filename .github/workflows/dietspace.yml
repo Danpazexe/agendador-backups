@@ -1,0 +1,80 @@
+name: Backup DietSpace
+
+on:
+  schedule:
+    - cron: "0 15 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: backup-dietspace
+  cancel-in-progress: false
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Mascarar host do banco
+        env:
+          URL: ${{ secrets.NEON_DATABASE_URL }}
+        run: |
+          host="$(printf '%s' "$URL" | sed -E 's#^[a-z]+://([^@]*@)?([^/:?]+).*#\2#')"
+          echo "::add-mask::$host"
+
+      - name: Cliente Postgres 18
+        run: |
+          sudo apt-get update -qq >/dev/null
+          sudo apt-get install -y -qq postgresql-common >/dev/null
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y >/dev/null 2>&1
+          sudo apt-get install -y -qq postgresql-client-18 >/dev/null
+          /usr/lib/postgresql/18/bin/pg_dump --version
+
+      - name: Dump criptografado
+        env:
+          URL: ${{ secrets.NEON_DATABASE_URL }}
+          PASS: ${{ secrets.BACKUP_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          bin=/usr/lib/postgresql/18/bin
+          arq="dietspace-$(TZ=America/Sao_Paulo date +%Y-%m-%d-%H%M).dump.enc"
+          "$bin/pg_dump" -Fc --no-owner --no-privileges -d "$URL" 2>/dev/null \
+            | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:PASS -out "$RUNNER_TEMP/$arq"
+          openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:PASS -in "$RUNNER_TEMP/$arq" \
+            | "$bin/pg_restore" -f /dev/null
+          echo "ARQ=$arq" >> "$GITHUB_ENV"
+          echo "ok: $(du -h "$RUNNER_TEMP/$arq" | cut -f1)"
+
+      - name: Enviar para o repositório privado
+        env:
+          DEPLOY_KEY: ${{ secrets.DIETSPACE_BACKUPS_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          git clone -q --depth 1 git@github.com:Danpazexe/dietspace-backups.git destino
+          cd destino
+          mkdir -p backups
+          mv "$RUNNER_TEMP/$ARQ" backups/
+          ls -1 backups/*.dump.enc | sort -r | tail -n +13 | xargs -r rm -f --
+          git checkout -q --orphan novo
+          git add -A
+          git -c user.name="agendador-backups" -c user.email="actions@users.noreply.github.com" \
+            commit -q -m "Backup $ARQ"
+          git push -q -f origin novo:main
+          rm -f ~/.ssh/id_ed25519
+          echo "backups guardados: $(ls backups | wc -l)"
+
+      - name: Manter agendamento ativo
+        run: |
+          git clone -q --depth 1 "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" proprio
+          cd proprio
+          TZ=America/Sao_Paulo date '+%Y-%m-%d' > ultima-execucao.txt
+          git add ultima-execucao.txt
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "Ultima execucao" || exit 0
+          git push -q
