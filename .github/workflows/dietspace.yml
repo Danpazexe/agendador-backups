@@ -37,11 +37,12 @@ jobs:
           URL: ${{ secrets.NEON_DATABASE_URL }}
           PASS: ${{ secrets.BACKUP_PASSPHRASE }}
         run: |
-          set -euo pipefail
+          set -eu
           bin=/usr/lib/postgresql/18/bin
           arq="dietspace-$(TZ=America/Sao_Paulo date +%Y-%m-%d-%H%M).dump.enc"
-          "$bin/pg_dump" -Fc --no-owner --no-privileges -d "$URL" 2>/dev/null \
+          "$bin/pg_dump" -Fc --no-owner --no-privileges -d "$URL" 2>"$RUNNER_TEMP/erro.txt" \
             | openssl enc -aes-256-cbc -pbkdf2 -iter 200000 -salt -pass env:PASS -out "$RUNNER_TEMP/$arq"
+          if [ -s "$RUNNER_TEMP/erro.txt" ]; then head -c 300 "$RUNNER_TEMP/erro.txt" | sed -E 's#[a-z]+://[^ ]+#<url>#g'; exit 1; fi
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -pass env:PASS -in "$RUNNER_TEMP/$arq" \
             | "$bin/pg_restore" -f /dev/null
           echo "ARQ=$arq" >> "$GITHUB_ENV"
